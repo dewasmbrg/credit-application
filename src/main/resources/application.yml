@@ -1,0 +1,82 @@
+spring:
+  application:
+    name: credit-risk-system
+
+  # Kafka Configuration
+  kafka:
+    # Kafka broker address
+    # For local development, use localhost:9092
+    # For Docker: kafka:9092
+    bootstrap-servers: localhost:9092
+
+    # Producer settings
+    producer:
+      # Use String for keys (topic names)
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # Use JSON for values (our events)
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      # Wait for acknowledgment from all replicas (safest option)
+      acks: all
+      # Retry failed sends up to 3 times
+      retries: 3
+
+    # Consumer settings
+    consumer:
+      # Consumer group ID (can be overridden in @KafkaListener)
+      group-id: credit-risk-group
+      # Use String for keys
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # Use JSON for values
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      # If no offset exists, start from the beginning of the topic
+      auto-offset-reset: earliest
+      # Automatically commit offsets (mark messages as processed)
+      enable-auto-commit: true
+      # Trust all packages for JSON deserialization (use specific packages in production!)
+      properties:
+        spring.json.trusted.packages: "*"
+
+  # Database Configuration (H2 in-memory for simplicity)
+  datasource:
+    url: jdbc:h2:mem:creditriskdb
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+
+  # JPA/Hibernate Configuration
+  jpa:
+    database-platform: org.hibernate.dialect.H2Dialect
+    hibernate:
+      # Create tables automatically from entities
+      ddl-auto: create-drop
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+  # H2 Console (for debugging - access at http://localhost:8080/h2-console)
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+# Server Configuration
+server:
+  port: 8080
+
+# Logging Configuration
+logging:
+  level:
+    com.creditrisk: DEBUG
+    org.springframework.kafka: INFO
+    org.apache.kafka: WARN
+
+---
+# Profile for running with Docker Compose
+spring:
+  config:
+    activate:
+      on-profile: docker
+
+  kafka:
+    bootstrap-servers: kafka:9092
