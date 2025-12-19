@@ -2,6 +2,7 @@ package com.creditrisk;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * Main Spring Boot application for Event-Driven Credit Risk System.
@@ -11,6 +12,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * - Asynchronous message processing
  * - Idempotency patterns
  * - Producer-consumer patterns
+ * - Transactional Outbox pattern
  *
  * To run this application:
  * 1. Start Kafka (see docker-compose.yml or run locally)
@@ -19,7 +21,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * 4. Watch the logs to see async processing in action
  *
  * Architecture flow:
- * User -> REST API -> Kafka -> Risk Consumer -> Kafka -> Decision Consumer
+ * User -> REST API -> Database (Outbox) -> Outbox Publisher -> Kafka -> Consumers
  *
  * Key learning points:
  * - REST API returns immediately (async)
@@ -27,8 +29,10 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * - Events are immutable
  * - Idempotency prevents duplicate processing
  * - Services are decoupled via events
+ * - Transactional Outbox ensures reliable event delivery
  */
 @SpringBootApplication
+@EnableScheduling  // Enable scheduled tasks for Outbox Publisher
 public class CreditRiskApplication {
 
     public static void main(String[] args) {

@@ -1,9 +1,13 @@
 package com.creditrisk.service;
 
+import com.creditrisk.config.KafkaTopics;
 import com.creditrisk.event.CreditApplicationSubmitted;
 import com.creditrisk.model.CreditApplication;
-import com.creditrisk.producer.EventProducer;
+import com.creditrisk.model.OutboxEvent;
 import com.creditrisk.repository.CreditApplicationRepository;
+import com.creditrisk.repository.OutboxEventRepository;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -16,22 +20,34 @@ import java.util.UUID;
 /**
  * Service for handling credit application submissions.
  *
- * TRANSACTION MANAGEMENT:
- * =======================
- * Notice @Transactional on submitApplication():
+ * TRANSACTIONAL OUTBOX PATTERN IMPLEMENTATION:
+ * ============================================
+ * This service now uses the Transactional Outbox pattern instead of direct Kafka publishing.
  *
- * This ensures that:
- * 1. Database save and event publishing happen in a single transaction
- * 2. If event publishing fails, database save is rolled back
- * 3. Data consistency is maintained
+ * OLD APPROACH (Dual-Write Problem):
+ * ----------------------------------
+ * 1. Save to database
+ * 2. Publish to Kafka directly
+ * Problem: If Kafka fails, we have data in DB but no event!
  *
- * However, there's a TRADE-OFF:
- * - If Kafka is down, the entire transaction fails
- * - In production, you might want to:
- *   a) Save to DB first, then publish (risk: event might fail to send)
- *   b) Use outbox pattern (advanced, not shown here)
+ * NEW APPROACH (Outbox Pattern):
+ * ------------------------------
+ * 1. Save business data (CreditApplication) to database
+ * 2. Save event to OUTBOX table in the SAME transaction
+ * 3. Both commit atomically
+ * 4. Background publisher reads outbox and publishes to Kafka
  *
- * For learning purposes, we keep it simple.
+ * BENEFITS:
+ * ---------
+ * - Atomic: Both saves happen in one transaction
+ * - Reliable: Events guaranteed to be published eventually
+ * - Kafka-independent: Application works even if Kafka is down
+ * - No data loss: Events are persisted before publishing
+ *
+ * TRADE-OFFS:
+ * -----------
+ * - Slight delay: Events published asynchronously (eventual consistency)
+ * - Extra table: Need to manage outbox events
  */
 @Service
 @RequiredArgsConstructor
@@ -39,18 +55,20 @@ import java.util.UUID;
 public class ApplicationService {
 
     private final CreditApplicationRepository applicationRepository;
-    private final EventProducer eventProducer;
+    private final OutboxEventRepository outboxEventRepository;
+    private final ObjectMapper objectMapper;
 
     /**
      * Submit a new credit application.
      *
-     * Flow:
+     * Flow (Transactional Outbox Pattern):
      * 1. Create and save application entity to database
      * 2. Create immutable event
-     * 3. Publish event to Kafka (asynchronously)
+     * 3. Save event to OUTBOX table (same transaction as #1)
      * 4. Return application ID to caller
+     * 5. Background publisher reads outbox and publishes to Kafka
      *
-     * Note: This method returns QUICKLY because Kafka publishing is async.
+     * Note: This method returns QUICKLY. Event publishing happens asynchronously.
      */
     @Transactional
     public String submitApplication(String customerId,
@@ -63,7 +81,7 @@ public class ApplicationService {
 
         log.info("Submitting credit application: {} for customer: {}", applicationId, customerId);
 
-        // 1. Save to database
+        // 1. Save business data to database
         CreditApplication application = new CreditApplication();
         application.setApplicationId(applicationId);
         application.setCustomerId(customerId);
@@ -87,12 +105,34 @@ public class ApplicationService {
                 Instant.now()
         );
 
-        // 3. Publish event to Kafka (async - doesn't block)
-        eventProducer.publishCreditApplication(event);
-
-        log.info("Published CreditApplicationSubmitted event: {}", applicationId);
+        // 3. Save event to OUTBOX table (SAME transaction as application save!)
+        try {
+            saveToOutbox(event, applicationId, "CreditApplicationSubmitted", KafkaTopics.CREDIT_APPLICATION_SUBMITTED);
+            log.info("Saved CreditApplicationSubmitted event to outbox: {}", applicationId);
+        } catch (JsonProcessingException e) {
+            log.error("Failed to serialize event for outbox: {}", applicationId, e);
+            throw new RuntimeException("Failed to save event to outbox", e);
+        }
 
         return applicationId;
+    }
+
+    /**
+     * Save event to outbox table.
+     * This is a helper method that serializes the event and saves it to the outbox.
+     */
+    private void saveToOutbox(Object event, String eventId, String eventType, String topic)
+            throws JsonProcessingException {
+
+        String payload = objectMapper.writeValueAsString(event);
+
+        OutboxEvent outboxEvent = new OutboxEvent();
+        outboxEvent.setEventId(eventId);
+        outboxEvent.setEventType(eventType);
+        outboxEvent.setPayload(payload);
+        outboxEvent.setTopic(topic);
+
+        outboxEventRepository.save(outboxEvent);
     }
 
     /**

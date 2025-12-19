@@ -3,14 +3,13 @@ package com.creditrisk.consumer;
 import com.creditrisk.config.KafkaTopics;
 import com.creditrisk.event.CreditApplicationSubmitted;
 import com.creditrisk.event.RiskAssessmentCompleted;
-import com.creditrisk.model.CreditApplication;
-import com.creditrisk.model.ProcessedEvent;
-import com.creditrisk.model.RiskAssessment;
-import com.creditrisk.model.RiskLevel;
-import com.creditrisk.producer.EventProducer;
+import com.creditrisk.model.*;
 import com.creditrisk.repository.CreditApplicationRepository;
+import com.creditrisk.repository.OutboxEventRepository;
 import com.creditrisk.repository.ProcessedEventRepository;
 import com.creditrisk.repository.RiskAssessmentRepository;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.annotation.KafkaListener;
@@ -28,13 +27,15 @@ import java.util.UUID;
  * ============================
  * This class runs on SEPARATE THREADS from the REST API.
  *
- * Flow:
+ * Flow (with Transactional Outbox):
  * 1. User calls POST /api/applications (REST thread)
- * 2. ApplicationService publishes event to Kafka (async)
+ * 2. ApplicationService saves to database + outbox (same transaction)
  * 3. REST API returns immediately (user gets response)
- * 4. THIS CONSUMER picks up the event (different thread!)
- * 5. Risk assessment happens in background
- * 6. Result is published as another event
+ * 4. Background publisher reads outbox and publishes to Kafka
+ * 5. THIS CONSUMER picks up the event (different thread!)
+ * 6. Risk assessment happens in background
+ * 7. Result is saved to database + outbox (atomic!)
+ * 8. Background publisher publishes result event
  *
  * User experience:
  * - Submits application -> Gets confirmation in <100ms
@@ -52,6 +53,15 @@ import java.util.UUID;
  *
  * This ensures that even if Kafka delivers the same event twice,
  * we only process it once.
+ *
+ * TRANSACTIONAL OUTBOX PATTERN:
+ * ==============================
+ * Instead of publishing directly to Kafka, this consumer:
+ * 1. Saves assessment data to database
+ * 2. Saves event to OUTBOX table (same transaction!)
+ * 3. Background publisher handles Kafka publishing
+ *
+ * This guarantees that if data is saved, the event WILL be published.
  */
 @Service
 @RequiredArgsConstructor
@@ -61,7 +71,8 @@ public class RiskAssessmentConsumer {
     private final ProcessedEventRepository processedEventRepository;
     private final CreditApplicationRepository applicationRepository;
     private final RiskAssessmentRepository riskAssessmentRepository;
-    private final EventProducer eventProducer;
+    private final OutboxEventRepository outboxEventRepository;
+    private final ObjectMapper objectMapper;
 
     /**
      * Kafka listener method.
@@ -139,8 +150,8 @@ public class RiskAssessmentConsumer {
         log.info("Risk assessment completed for application: {} with risk level: {}",
                 event.applicationId(), riskLevel);
 
-        // ==================== PUBLISH RESULT EVENT ====================
-        // Create and publish the next event in the chain
+        // ==================== SAVE RESULT EVENT TO OUTBOX ====================
+        // Create event and save to outbox (instead of publishing directly to Kafka)
         RiskAssessmentCompleted resultEvent = new RiskAssessmentCompleted(
                 assessmentId,
                 event.applicationId(),
@@ -150,9 +161,32 @@ public class RiskAssessmentConsumer {
                 Instant.now()
         );
 
-        eventProducer.publishRiskAssessment(resultEvent);
+        // Save to outbox table (SAME transaction as risk assessment save!)
+        try {
+            saveToOutbox(resultEvent, assessmentId, "RiskAssessmentCompleted", KafkaTopics.RISK_ASSESSMENT_COMPLETED);
+            log.info("Saved RiskAssessmentCompleted event to outbox for application: {}", event.applicationId());
+        } catch (JsonProcessingException e) {
+            log.error("Failed to serialize event for outbox: {}", assessmentId, e);
+            throw new RuntimeException("Failed to save event to outbox", e);
+        }
+    }
 
-        log.info("Published RiskAssessmentCompleted event for application: {}", event.applicationId());
+    /**
+     * Save event to outbox table.
+     * This is a helper method that serializes the event and saves it to the outbox.
+     */
+    private void saveToOutbox(Object event, String eventId, String eventType, String topic)
+            throws JsonProcessingException {
+
+        String payload = objectMapper.writeValueAsString(event);
+
+        OutboxEvent outboxEvent = new OutboxEvent();
+        outboxEvent.setEventId(eventId);
+        outboxEvent.setEventType(eventType);
+        outboxEvent.setPayload(payload);
+        outboxEvent.setTopic(topic);
+
+        outboxEventRepository.save(outboxEvent);
     }
 
     /**
