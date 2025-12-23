@@ -36,6 +36,38 @@ spring:
       properties:
         spring.json.trusted.packages: "*"
 
+  # Redis Configuration
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      # Password for production - leave empty for local dev
+      # password:
+      # Connection pool settings (Lettuce client)
+      lettuce:
+        pool:
+          max-active: 8      # Maximum connections in pool
+          max-idle: 8        # Maximum idle connections
+          min-idle: 2        # Minimum idle connections to maintain
+          max-wait: 2000ms   # Maximum wait time for connection
+        # Connection timeout
+        timeout: 3000ms
+      # Database index (Redis supports 16 databases 0-15)
+      database: 0
+
+  # Spring Cache Configuration
+  cache:
+    type: redis
+    redis:
+      # Global TTL for cached entries (30 minutes)
+      time-to-live: 1800000
+      # Don't cache null values (prevents cache pollution)
+      cache-null-values: false
+      # Use key prefix to avoid collisions
+      use-key-prefix: true
+      # Key prefix for all cache entries
+      key-prefix: "credit-risk:"
+
   # Database Configuration (H2 file-based for persistence)
   datasource:
     url: jdbc:h2:file:./data/creditriskdb;AUTO_SERVER=TRUE
@@ -60,6 +92,11 @@ spring:
       enabled: true
       path: /h2-console
 
+# Redisson Configuration (for distributed locking)
+redisson:
+  # Configuration file path
+  config: classpath:redisson-config.yml
+
 # Server Configuration
 server:
   port: 8080
@@ -80,3 +117,8 @@ spring:
 
   kafka:
     bootstrap-servers: kafka:9092
+
+  # Redis host for Docker
+  data:
+    redis:
+      host: redis

@@ -40,6 +40,36 @@ services:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
 
+  # Redis for caching, idempotency, and distributed locking
+  redis:
+    image: redis:7.2-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    # Persist data to disk using AOF (Append Only File)
+    command: redis-server --appendonly yes --appendfsync everysec
+    volumes:
+      # Persist Redis data across container restarts
+      - redis-data:/data
+    # Health check to ensure Redis is ready
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    # Resource limits (optional but recommended)
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+# Volumes for persistent data
+volumes:
+  redis-data:
+    driver: local
+
 # To start Kafka:
 # docker-compose up -d
 

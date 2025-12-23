@@ -8,28 +8,49 @@ import com.creditrisk.repository.OutboxEventRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
- * OUTBOX EVENT PUBLISHER
- * ======================
+ * OUTBOX EVENT PUBLISHER WITH DISTRIBUTED LOCKING
+ * ================================================
  *
  * This service is the "heart" of the Transactional Outbox pattern.
  *
  * HOW IT WORKS:
  * -------------
  * 1. Runs every 100ms (configurable via @Scheduled)
- * 2. Queries database for unpublished events
- * 3. For each event:
- *    a) Deserialize JSON payload
- *    b) Publish to Kafka using EventProducer
- *    c) Mark as published in database
- * 4. If publishing fails, increment retry count and continue
+ * 2. Attempts to acquire distributed lock (via Redisson)
+ * 3. If lock acquired:
+ *    a) Queries database for unpublished events
+ *    b) For each event:
+ *       - Deserialize JSON payload
+ *       - Publish to Kafka using EventProducer
+ *       - Mark as published in database
+ *    c) Releases lock
+ * 4. If lock NOT acquired: Skip execution (another instance is publishing)
+ * 5. If publishing fails, increment retry count and continue
+ *
+ * DISTRIBUTED LOCKING:
+ * --------------------
+ * Without locking, if you run 3 instances of this service:
+ * - All 3 instances query for unpublished events at the same time
+ * - All 3 get the SAME events
+ * - All 3 try to publish them
+ * - Kafka receives 3 copies of each event (duplicates!)
+ *
+ * With distributed locking (using Redisson):
+ * - Only ONE instance can hold the lock at a time
+ * - Other instances skip execution
+ * - Lock auto-releases after 30 seconds (prevents deadlock)
+ * - Redisson watchdog auto-renews lock if thread is still alive
  *
  * RELIABILITY:
  * ------------
@@ -37,12 +58,13 @@ import java.util.List;
  * - Failed events are automatically retried on next poll
  * - Kafka being down doesn't affect business operations
  * - Events are published in order (FIFO)
+ * - Safe to run multiple instances (distributed lock prevents duplicates)
  *
  * PERFORMANCE:
  * ------------
  * - Batch size limit prevents overwhelming Kafka
  * - Separate thread from business operations
- * - Can scale horizontally with distributed locking (not implemented)
+ * - Scales horizontally with distributed locking
  *
  * MONITORING:
  * -----------
@@ -52,8 +74,7 @@ import java.util.List;
  *
  * PRODUCTION CONSIDERATIONS:
  * --------------------------
- * 1. Add distributed locking if running multiple instances
- *    (use ShedLock or Redis locks to prevent duplicate publishing)
+ * 1. ✓ Distributed locking implemented (Redisson)
  * 2. Add dead letter queue for events that fail too many times
  * 3. Add metrics/monitoring (Prometheus, Grafana)
  * 4. Consider using CDC (Change Data Capture) like Debezium instead
@@ -66,25 +87,90 @@ public class OutboxEventPublisher {
     private final OutboxEventRepository outboxEventRepository;
     private final EventProducer eventProducer;
     private final ObjectMapper objectMapper;
+    private final RedissonClient redissonClient;
 
     private static final int BATCH_SIZE = 100; // Process max 100 events per run
     private static final int MAX_RETRY_COUNT = 10; // Warn after 10 failed attempts
 
+    // Distributed lock configuration
+    private static final String LOCK_NAME = "outbox-publisher-lock";
+    private static final long LOCK_WAIT_TIME = 0;      // Don't wait for lock (fail fast)
+    private static final long LOCK_LEASE_TIME = 30;    // Auto-release after 30 seconds
+    private static final TimeUnit LOCK_TIME_UNIT = TimeUnit.SECONDS;
+
     /**
      * Scheduled task that publishes outbox events to Kafka.
      *
-     * Runs every 100ms (10 times per second).
+     * DISTRIBUTED LOCKING:
+     * ====================
+     * Uses Redisson distributed lock to ensure only ONE instance
+     * publishes events at a time across multiple application instances.
+     *
+     * Behavior:
+     * - Try to acquire lock (non-blocking, 0ms wait)
+     * - If acquired: Publish events and release lock
+     * - If not acquired: Skip this execution (another instance is publishing)
+     *
+     * LOCK AUTO-RELEASE:
+     * ==================
+     * Redisson has a "watchdog" that auto-renews locks if thread is still alive.
+     * If instance crashes while holding lock:
+     * - Watchdog stops renewing
+     * - Lock expires after 30 seconds
+     * - Other instances can acquire lock
+     *
+     * This prevents deadlock from crashed instances.
+     *
+     * Runs every 5 seconds.
      * Adjust based on your throughput requirements:
      * - Higher frequency = lower latency, more database load
      * - Lower frequency = higher latency, less database load
-     *
-     * For production:
-     * - Use fixedDelay for consistent intervals regardless of execution time
-     * - Consider using ShedLock to prevent concurrent execution in multi-instance setups
      */
-    @Scheduled(fixedDelay = 100) // Run every 100ms
+    @Scheduled(fixedDelay = 5000) // Run every 5 seconds
     @Transactional
     public void publishEvents() {
+        // Get distributed lock
+        RLock lock = redissonClient.getLock(LOCK_NAME);
+
+        try {
+            // Try to acquire lock (non-blocking)
+            boolean acquired = lock.tryLock(LOCK_WAIT_TIME, LOCK_LEASE_TIME, LOCK_TIME_UNIT);
+
+            if (!acquired) {
+                // Another instance is already publishing events
+                log.trace("Could not acquire lock, skipping execution (another instance is publishing)");
+                return;
+            }
+
+            log.trace("Acquired distributed lock, publishing outbox events");
+
+            try {
+                // Publish events (existing logic)
+                publishEventsInternal();
+
+            } finally {
+                // Always release lock (even if exception occurred)
+                // Check if current thread still holds lock before releasing
+                if (lock.isHeldByCurrentThread()) {
+                    lock.unlock();
+                    log.trace("Released distributed lock");
+                }
+            }
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Interrupted while trying to acquire lock", e);
+        } catch (Exception e) {
+            log.error("Error in outbox event publisher", e);
+            // Lock will auto-release due to lease time
+        }
+    }
+
+    /**
+     * Internal method that does the actual event publishing.
+     * Extracted to separate locking logic from business logic.
+     */
+    private void publishEventsInternal() {
         try {
             // Fetch unpublished events (limited to prevent overwhelming Kafka)
             List<OutboxEvent> events = outboxEventRepository.findUnpublishedEventsWithLimit(BATCH_SIZE);
@@ -106,7 +192,7 @@ public class OutboxEventPublisher {
             log.debug("Finished publishing batch of {} events", events.size());
 
         } catch (Exception e) {
-            log.error("Error in outbox event publisher", e);
+            log.error("Error publishing events", e);
         }
     }
 

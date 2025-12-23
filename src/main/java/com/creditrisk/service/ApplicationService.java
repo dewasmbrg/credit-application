@@ -10,6 +10,9 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.CachePut;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -137,9 +140,43 @@ public class ApplicationService {
 
     /**
      * Get application by ID.
+     *
+     * CACHING STRATEGY:
+     * =================
+     * @Cacheable: Spring checks cache first
+     * - Cache HIT: Returns cached value (no DB query)
+     * - Cache MISS: Calls method, stores result in cache
+     *
+     * Key: applicationId (simple, unique identifier)
+     * TTL: 30 minutes (configured in RedisConfig)
+     *
+     * CACHE EVICTION:
+     * ===============
+     * Cache is evicted when:
+     * 1. Application status changes (see evictApplicationCache method)
+     * 2. TTL expires (30 minutes)
+     *
+     * PERFORMANCE IMPACT:
+     * ===================
+     * Before: Every GET hits database
+     * After: First GET hits database, subsequent GETs hit Redis (sub-millisecond)
      */
+    @Cacheable(value = "applications", key = "#applicationId")
     public CreditApplication getApplication(String applicationId) {
+        log.debug("Cache miss - fetching application from database: {}", applicationId);
         return applicationRepository.findByApplicationId(applicationId)
                 .orElseThrow(() -> new IllegalArgumentException("Application not found: " + applicationId));
+    }
+
+    /**
+     * Evict application from cache.
+     * Call this whenever application status changes.
+     *
+     * This ensures cache consistency - when application data changes in the database,
+     * we remove the cached copy so the next GET will fetch fresh data.
+     */
+    @CacheEvict(value = "applications", key = "#applicationId")
+    public void evictApplicationCache(String applicationId) {
+        log.debug("Evicted application from cache: {}", applicationId);
     }
 }

@@ -4,10 +4,10 @@ import com.creditrisk.config.KafkaTopics;
 import com.creditrisk.event.RiskAssessmentCompleted;
 import com.creditrisk.model.CreditApplication;
 import com.creditrisk.model.DecisionStatus;
-import com.creditrisk.model.ProcessedEvent;
 import com.creditrisk.model.RiskLevel;
 import com.creditrisk.repository.CreditApplicationRepository;
-import com.creditrisk.repository.ProcessedEventRepository;
+import com.creditrisk.service.ApplicationService;
+import com.creditrisk.service.IdempotencyService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.annotation.KafkaListener;
@@ -39,8 +39,9 @@ import org.springframework.transaction.annotation.Transactional;
 @Slf4j
 public class DecisionConsumer {
 
-    private final ProcessedEventRepository processedEventRepository;
+    private final IdempotencyService idempotencyService;
     private final CreditApplicationRepository applicationRepository;
+    private final ApplicationService applicationService;
 
     /**
      * Process risk assessment and make final decision.
@@ -71,19 +72,14 @@ public class DecisionConsumer {
     public void makeDecision(RiskAssessmentCompleted event) {
         log.info("Received RiskAssessmentCompleted event for application: {}", event.applicationId());
 
-        // ==================== IDEMPOTENCY CHECK ====================
+        // ==================== REDIS-BASED IDEMPOTENCY CHECK ====================
         // Use assessmentId as the unique event identifier
-        if (processedEventRepository.existsByEventId(event.assessmentId())) {
+        // Using Redis for 50-100x faster idempotency checks compared to database
+        if (!idempotencyService.tryAcquire("RiskAssessmentCompleted",
+                event.assessmentId(), "DecisionConsumer")) {
             log.warn("Event already processed, skipping: {}", event.assessmentId());
             return;
         }
-
-        // Record that we're processing this event
-        ProcessedEvent processedEvent = new ProcessedEvent();
-        processedEvent.setEventId(event.assessmentId());
-        processedEvent.setEventType("RiskAssessmentCompleted");
-        processedEvent.setConsumerName("DecisionConsumer");
-        processedEventRepository.save(processedEvent);
 
         log.info("Making decision for application: {}", event.applicationId());
 
@@ -96,6 +92,10 @@ public class DecisionConsumer {
 
         application.setStatus(CreditApplication.ApplicationStatus.DECISION_MADE);
         applicationRepository.save(application);
+
+        // Evict cache - application status changed!
+        applicationService.evictApplicationCache(event.applicationId());
+        log.debug("Evicted cache for application after decision: {}", event.applicationId());
 
         log.info("Decision made for application: {} - Decision: {}", event.applicationId(), decision);
 

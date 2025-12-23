@@ -1,0 +1,44 @@
+# Redisson Configuration for Distributed Locking
+# This configuration is used by the OutboxEventPublisher for distributed locks
+
+# Single Server Mode (for development and single Redis instance)
+singleServerConfig:
+  # Redis server address
+  address: "redis://localhost:6379"
+
+  # Connection pool size for better performance
+  connectionPoolSize: 64
+  connectionMinimumIdleSize: 10
+
+  # Timeout for Redis commands (milliseconds)
+  timeout: 3000
+
+  # Retry configuration for failed commands
+  retryAttempts: 3
+  retryInterval: 1500
+
+# Thread pool sizes for Redisson internal operations
+threads: 16
+nettyThreads: 32
+
+# Codec for serialization
+# JsonJacksonCodec: Serializes objects to JSON (human-readable, debuggable)
+# Alternative: org.redisson.codec.FstCodec (faster binary serialization)
+codec: !<org.redisson.codec.JsonJacksonCodec> {}
+
+# For production with Redis Cluster, replace singleServerConfig with:
+# clusterServersConfig:
+#   nodeAddresses:
+#     - "redis://node1:6379"
+#     - "redis://node2:6379"
+#     - "redis://node3:6379"
+#   scanInterval: 2000
+
+# For production with Redis Sentinel, replace singleServerConfig with:
+# sentinelServersConfig:
+#   masterName: "mymaster"
+#   sentinelAddresses:
+#     - "redis://sentinel1:26379"
+#     - "redis://sentinel2:26379"
+#     - "redis://sentinel3:26379"
+#   readMode: MASTER_SLAVE

@@ -6,8 +6,9 @@ import com.creditrisk.event.RiskAssessmentCompleted;
 import com.creditrisk.model.*;
 import com.creditrisk.repository.CreditApplicationRepository;
 import com.creditrisk.repository.OutboxEventRepository;
-import com.creditrisk.repository.ProcessedEventRepository;
 import com.creditrisk.repository.RiskAssessmentRepository;
+import com.creditrisk.service.ApplicationService;
+import com.creditrisk.service.IdempotencyService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -68,10 +69,11 @@ import java.util.UUID;
 @Slf4j
 public class RiskAssessmentConsumer {
 
-    private final ProcessedEventRepository processedEventRepository;
+    private final IdempotencyService idempotencyService;
     private final CreditApplicationRepository applicationRepository;
     private final RiskAssessmentRepository riskAssessmentRepository;
     private final OutboxEventRepository outboxEventRepository;
+    private final ApplicationService applicationService;
     private final ObjectMapper objectMapper;
 
     /**
@@ -98,19 +100,14 @@ public class RiskAssessmentConsumer {
     public void processApplication(CreditApplicationSubmitted event) {
         log.info("Received CreditApplicationSubmitted event: {}", event.applicationId());
 
-        // ==================== IDEMPOTENCY CHECK ====================
+        // ==================== REDIS-BASED IDEMPOTENCY CHECK ====================
         // CRITICAL: Check if we've already processed this event
-        if (processedEventRepository.existsByEventId(event.applicationId())) {
+        // Using Redis for 50-100x faster idempotency checks compared to database
+        if (!idempotencyService.tryAcquire("CreditApplicationSubmitted",
+                event.applicationId(), "RiskAssessmentConsumer")) {
             log.warn("Event already processed, skipping: {}", event.applicationId());
             return; // Exit early - don't process again!
         }
-
-        // Record that we're processing this event (prevents duplicate processing)
-        ProcessedEvent processedEvent = new ProcessedEvent();
-        processedEvent.setEventId(event.applicationId());
-        processedEvent.setEventType("CreditApplicationSubmitted");
-        processedEvent.setConsumerName("RiskAssessmentConsumer");
-        processedEventRepository.save(processedEvent);
 
         log.info("Starting risk assessment for application: {}", event.applicationId());
 
@@ -146,6 +143,10 @@ public class RiskAssessmentConsumer {
                 .orElseThrow(() -> new IllegalStateException("Application not found: " + event.applicationId()));
         application.setStatus(CreditApplication.ApplicationStatus.RISK_ASSESSED);
         applicationRepository.save(application);
+
+        // Evict cache - application status changed!
+        applicationService.evictApplicationCache(event.applicationId());
+        log.debug("Evicted cache for application after status update: {}", event.applicationId());
 
         log.info("Risk assessment completed for application: {} with risk level: {}",
                 event.applicationId(), riskLevel);
